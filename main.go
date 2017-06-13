@@ -248,37 +248,6 @@ func NewPhpFpmPoolExporter(pools []*PhpFpmPool) *PhpFpmPoolExporter {
 	}
 }
 
-func GetFilesIn(dirPath string) []string {
-	var poolFiles []string
-
-	if strings.HasSuffix(dirPath, "/") {
-		dirPath = strings.TrimRight(dirPath, "/")
-	}
-
-	dir, err := os.Open(dirPath)
-
-	if err != nil {
-		fmt.Errorf("%s", err)
-		return nil
-	}
-	defer dir.Close()
-
-	filesInfo, err := dir.Readdir(-1)
-
-	if err != nil {
-		fmt.Errorf("%s", err)
-		return nil
-	}
-
-	for i := 0; i < len(filesInfo); i++ {
-		if filesInfo[i].Mode().IsRegular() {
-			poolFiles = append(poolFiles, dirPath+"/"+filesInfo[i].Name())
-		}
-	}
-
-	return poolFiles
-}
-
 func PollFpmStatusMetrics(p *PhpFpmPool, fetcher func() (string, error), pollInterval int, mustQuit chan bool, done chan bool) {
 
 	var mts FpmPoolMetrics
@@ -471,8 +440,10 @@ func main() {
 	log.Infoln("Awaiting quit signal")
 
 	<-sigs
+    mustQuit <- true
 
 	log.Infoln("Awaiting all done signals")
+    <-done
 
 	close(mustQuit)
 	close(done)
