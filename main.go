@@ -2,13 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -21,8 +19,6 @@ import (
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	"github.com/tomasen/fcgi_client"
-	"golang.org/x/net/context"
-	"gopkg.in/ini.v1"
 )
 
 const (
@@ -392,60 +388,18 @@ func NativeClientFcgiStatusFetcher(p *PhpFpmPool, fcgiConnectTimeout int) func()
 	}
 }
 
-func CgiFcgiFcgiStatusFetcher(p *PhpFpmPool, pollTimeout int, cgiFastCgiPath string, cgiFastCgiLdLibPath string) func() (string, error) {
-	poolCpy := p.GetSyncedCopy()
-	endpoint := poolCpy.Endpoint
-
-	env := os.Environ()
-
-	if cgiFastCgiLdLibPath != "" {
-		env = append(env, fmt.Sprintf("LD_LIBRARY_PATH=%s", cgiFastCgiLdLibPath))
-	}
-
-	env = append(env, fmt.Sprintf("SCRIPT_NAME=%s", poolCpy.StatusUri))
-	env = append(env, fmt.Sprintf("SCRIPT_FILENAME=%s", poolCpy.StatusUri))
-	env = append(env, "QUERY_STRING=json")
-	env = append(env, "REQUEST_METHOD=GET")
-
-	return func() (string, error) {
-		var data []byte
-		var err error
-		var strData []string
-
-		ctx := context.TODO()
-		ctxWithCancel, cancel := context.WithTimeout(ctx, time.Duration(pollTimeout*int(time.Second)))
-		defer cancel()
-
-		cmd := exec.CommandContext(ctxWithCancel, cgiFastCgiPath, "-bind", "-connect", endpoint)
-		cmd.Env = env
-		data, err = cmd.Output()
-		if err != nil {
-			return "", err
-		}
-
-		strData = strings.SplitAfter(string(data), "\r\n\r\n")
-		if len(strData) < 2 {
-			return "", errors.New("Unexpected cgi-fcgi response")
-		}
-
-		return strData[1], nil
-	}
-}
-
 func main() {
-	var (
-		listenAddress       = flag.String("web.listen-address", ":9101", "Address to listen on for web interface and telemetry.")
-		metricsPath         = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
-		phpfpmPidFile       = flag.String("phpfpm.pid-file", "/var/run/php5-fpm.pid", "Path to phpfpm's pid file.")
-		configDir           = flag.String("phpfpm.config", "/etc/php5/fpm/pool.d/", "Pools conf dir")
-		pollInterval        = flag.Int("phpfpm.poll-interval", 10, "Poll interval in seconds")
-		useNativeClient     = flag.Bool("phpfpm.use-native-client", true, "Use a native go client to get status or use external cgi-fcgi command")
-		ncConnectTimeout    = flag.Int("nc.connect-timeout", 500, "Native client connect timeout in ms")
-		pollTimeout         = flag.Int("cgi-fcgi.poll-timeout", 2, "Poll timeout in seconds")
-		cgiFastCgiPath      = flag.String("cgi-fcgi.path", "/usr/bin/cgi-fcgi", "cgi-fcgi program path")
-		cgiFastCgiLdLibPath = flag.String("cgi-fcgi.ld-library-path", "", "LD_LIBRARY_PATH value to run cgi-fcgi")
-		showVersion         = flag.Bool("version", false, "Print version information.")
-	)
+    var (
+        listenAddress       = flag.String("web.listen-address", ":9101", "Address to listen on for web interface and telemetry.")
+        metricsPath         = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
+        phpfpmPidFile       = flag.String("phpfpm.pid-file", "/var/run/php5-fpm.pid", "Path to phpfpm's pid file.")
+        poolName            = flag.String("phpfpm.pool_name", "www", "phpfpm's pool name")
+        listenKey           = flag.String("phpfpm.listen_key", "127.0.0.1:9000", "FPM address")
+        statusKey           = flag.String("phpfpm.status_key", "/fpm_status", "FPM status path")
+        pollInterval        = flag.Int("phpfpm.poll-interval", 10, "Poll interval in seconds")
+        ncConnectTimeout    = flag.Int("nc.connect-timeout", 500, "Native client connect timeout in ms")
+        showVersion         = flag.Bool("version", false, "Print version information.")
+    )
 
 	flag.Parse()
 
@@ -485,52 +439,15 @@ func main() {
 
 	phpFpmPools := []*PhpFpmPool{}
 
-	confFiles := GetFilesIn(*configDir)
-	cfg := ini.Empty()
+	pool := PhpFpmPool{Name: *poolName, Endpoint: *listenKey, StatusUri: *statusKey}
 
-	for _, cf := range confFiles {
-		log.Infoln("We will parse: ", cf)
-		err := cfg.Append(cf)
+	var fetcher func() (string, error)
 
-		if err != nil {
-			fmt.Errorf("%f")
-		}
-	}
+	fetcher = NativeClientFcgiStatusFetcher(&pool, *ncConnectTimeout)
 
-	sections := cfg.SectionStrings()
-	sectionsCount := 0
+	go PollFpmStatusMetrics(&pool, fetcher, *pollInterval, mustQuit, done)
 
-	for _, sect := range sections {
-		statusKey, err := cfg.Section(sect).GetKey("pm.status_path")
-
-		if err != nil {
-			continue
-		}
-
-		listenKey, err := cfg.Section(sect).GetKey("listen")
-
-		if err != nil {
-			continue
-		}
-
-		pool := PhpFpmPool{Name: sect, Endpoint: listenKey.String(), StatusUri: statusKey.String()}
-
-		sectionsCount++
-
-		var fetcher func() (string, error)
-
-		if *useNativeClient {
-			fetcher = NativeClientFcgiStatusFetcher(&pool, *ncConnectTimeout)
-		} else {
-			fetcher = CgiFcgiFcgiStatusFetcher(&pool, *pollTimeout, *cgiFastCgiPath, *cgiFastCgiLdLibPath)
-		}
-
-		go PollFpmStatusMetrics(&pool, fetcher, *pollInterval, mustQuit, done)
-
-		phpFpmPools = append(phpFpmPools, &pool)
-	}
-
-	log.Infoln("We will monitor ", sectionsCount, " phpfpm pool(s)")
+	phpFpmPools = append(phpFpmPools, &pool)
 
 	phpFpmExporter := NewPhpFpmPoolExporter(phpFpmPools)
 
@@ -555,15 +472,8 @@ func main() {
 
 	<-sigs
 
-	for j := 0; j < sectionsCount; j++ {
-		mustQuit <- true
-	}
-
 	log.Infoln("Awaiting all done signals")
 
-	for j := 0; j < sectionsCount; j++ {
-		<-done
-	}
 	close(mustQuit)
 	close(done)
 	log.Infoln("Clean shutdown!")
